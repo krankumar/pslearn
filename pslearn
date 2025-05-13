@@ -1,0 +1,134 @@
+# ==========================================
+# Azure Automation PowerShell Runbook
+# List storage account capacities across subscriptions
+# Alert on usage exceeding tag-defined threshold or default
+# ==========================================
+
+# --- Configuration ---
+$TagName = "test_tag_val"
+$DefaultThresholdGB = 10
+$UseAllSubscriptions = $false              # Set to $true to process ALL subscriptions
+$UseSpecificSubscriptions = $false         # Set to $true to use only specific subscriptions
+$SpecificSubscriptionIds = @(
+    # "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+)
+$ExcludedStorageAccounts = @(
+    # "excludedstoracct1", "excludedstoracct2"
+)
+
+# --- Authenticate with Managed Identity (for Automation Account) ---
+try {
+    Connect-AzAccount -Identity | Out-Null
+} catch {
+    Write-Error "Failed to authenticate using Managed Identity: $_"
+    exit
+}
+
+# --- Retrieve all subscriptions ---
+try {
+    $subscriptions = Get-AzSubscription
+} catch {
+    Write-Error "Failed to retrieve subscriptions: $_"
+    exit
+}
+
+# --- Validate conflicting flags ---
+if ($UseSpecificSubscriptions -and $UseAllSubscriptions) {
+    Write-Warning "Both 'UseSpecificSubscriptions' and 'UseAllSubscriptions' are set to true. 'UseSpecificSubscriptions' takes precedence."
+}
+
+# --- Determine target subscriptions ---
+if ($UseSpecificSubscriptions -and $SpecificSubscriptionIds.Count -gt 0) {
+    $targetSubscriptions = $subscriptions | Where-Object { $SpecificSubscriptionIds -contains $_.Id }
+} elseif ($UseAllSubscriptions) {
+    $targetSubscriptions = $subscriptions
+} else {
+    $targetSubscriptions = $subscriptions | Where-Object {
+        try {
+            $_.Tags.ContainsKey($TagName)
+        } catch {
+            $false
+        }
+    }
+}
+
+if (-not $targetSubscriptions -or $targetSubscriptions.Count -eq 0) {
+    Write-Warning "No subscriptions matched the criteria. Exiting script."
+    exit
+}
+
+# --- Initialize result collections ---
+$allResults = @()
+$exceedingResults = @()
+
+# --- Process each subscription ---
+foreach ($sub in $targetSubscriptions) {
+    try {
+        Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop | Out-Null
+        Write-Output "`nProcessing Subscription: $($sub.Name)"
+
+        # Determine threshold value
+        $thresholdGB = $DefaultThresholdGB
+        try {
+            if ($sub.Tags.ContainsKey($TagName)) {
+                $tagVal = $sub.Tags[$TagName]
+                if ([int]::TryParse($tagVal, [ref]$null)) {
+                    $thresholdGB = [int]$tagVal
+                }
+            }
+        } catch {
+            Write-Warning "Failed to parse threshold tag value for subscription '$($sub.Name)'. Using default ($DefaultThresholdGB GB)."
+        }
+
+        # Get all storage accounts
+        $storageAccounts = Get-AzStorageAccount
+        foreach ($storage in $storageAccounts) {
+            try {
+                if ($ExcludedStorageAccounts -contains $storage.StorageAccountName) {
+                    continue
+                }
+
+                # Default usage placeholder
+                $usageGB = 0
+                $ctx = $storage.Context
+
+                # Get blob usage estimate
+                $metrics = Get-AzStorageUsage -Context $ctx -ServiceType Blob
+                $blobUsageBytes = ($metrics | Where-Object { $_.Name -eq "BlobCapacity" }).CurrentValue
+                $usageGB = [math]::Round($blobUsageBytes / 1GB, 2)
+
+                $entry = [PSCustomObject]@{
+                    SubscriptionName     = $sub.Name
+                    SubscriptionId       = $sub.Id
+                    StorageAccountName   = $storage.StorageAccountName
+                    ResourceGroup        = $storage.ResourceGroupName
+                    Location             = $storage.Location
+                    CapacityUsedGB       = $usageGB
+                    ThresholdGB          = $thresholdGB
+                    ExceedsThreshold     = $usageGB -gt $thresholdGB
+                }
+
+                $allResults += $entry
+                if ($entry.ExceedsThreshold) {
+                    $exceedingResults += $entry
+                }
+            } catch {
+                Write-Warning "Error checking storage account '$($storage.StorageAccountName)': $_"
+            }
+        }
+    } catch {
+        Write-Warning "Error processing subscription '$($sub.Name)': $_"
+    }
+}
+
+# --- Output Results ---
+
+Write-Output "`n========== ALL STORAGE ACCOUNT CAPACITIES =========="
+$allResults | Sort-Object SubscriptionName, StorageAccountName | Format-Table -AutoSize
+
+Write-Output "`n========== STORAGE ACCOUNTS EXCEEDING THRESHOLD =========="
+if ($exceedingResults.Count -eq 0) {
+    Write-Output "No storage accounts exceeded the threshold."
+} else {
+    $exceedingResults | Sort-Object SubscriptionName, StorageAccountName | Format-Table -AutoSize
+}
